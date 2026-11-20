@@ -2841,6 +2841,13 @@ begin
         else
           FAdoHandle.ConnectionString := FAdoHandle.ConnectionString + 'Trusted_Connection=yes;'
       end;
+
+      // MSOLEDBSQL 19+ encrypts by default and always validates the server certificate.
+      // Only a connection string keyword can relax that, the registry setting cannot.
+      // So map the "trust the server certificate" option of the SSL tab to it.
+      // See https://github.com/HeidiSQL/HeidiSQL/issues/2309
+      if Parameters.WantSSL and Parameters.LibraryOrProvider.StartsWith('MSOLEDBSQL', true) then
+        FAdoHandle.ConnectionString := FAdoHandle.ConnectionString + 'Trust Server Certificate=true;';
     except
       on E:EOleException do
         raise EDbError.Create(E.Message);
@@ -2860,6 +2867,13 @@ begin
         FServerUptime := StrToIntDef(GetVar('SELECT DATEDIFF(SECOND, '+QuoteIdent('login_time')+', CURRENT_TIMESTAMP) FROM '+QuoteIdent('master')+'.'+QuoteIdent('dbo')+'.'+QuoteIdent('sysprocesses')+' WHERE '+QuoteIdent('spid')+'=1'), -1);
       except
         FServerUptime := -1;
+      end;
+      try
+        // Detect whether the connection we just made is encrypted, for the SSL indicator.
+        // Rarely unsupported (old servers), then we simply report no encryption.
+        FIsSSL := UpperCase(Trim(GetVar('SELECT encrypt_option FROM sys.dm_exec_connections WHERE session_id = @@SPID'))) = 'TRUE';
+      except
+        FIsSSL := False;
       end;
       FServerDateTimeOnStartup := GetVar('SELECT ' + FSqlProvider.GetSql(qFuncNow));
       // Microsoft SQL Server 2008 R2 (RTM) - 10.50.1600.1 (Intel X86)

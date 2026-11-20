@@ -1687,17 +1687,20 @@ begin
       chkForceUnicode.Enabled := Params.NetTypeGroup = ngMySQL;
       editLogFilePath.Enabled := Params.LogFileDdl or Params.LogFileDml;
       // SSL tab:
-      chkWantSSL.Enabled := Params.NetType in [ntMySQL_TCPIP, ntMySQL_SSHtunnel, ntMySQL_ProxySQLAdmin, ntMySQL_ClickHouse, ntMySQL_RDS, ntPgSQL_TCPIP, ntPgSQL_SSHtunnel];
-      lblSSLPrivateKey.Enabled := Params.WantSSL;
-      editSSLPrivateKey.Enabled := Params.WantSSL;
-      lblSSLCACertificate.Enabled := Params.WantSSL;
-      editSSLCACertificate.Enabled := Params.WantSSL;
-      lblSSLCertificate.Enabled := Params.WantSSL;
-      editSSLCertificate.Enabled := Params.WantSSL;
-      lblSSLcipher.Enabled := Params.WantSSL;
-      editSSLcipher.Enabled := Params.WantSSL;
-      lblSSLVerification.Enabled := Params.WantSSL;
-      comboSSLVerification.Enabled := Params.WantSSL;
+      chkWantSSL.Enabled := Params.NetType in [ntMySQL_TCPIP, ntMySQL_SSHtunnel, ntMySQL_ProxySQLAdmin, ntMySQL_ClickHouse, ntMySQL_RDS, ntPgSQL_TCPIP, ntPgSQL_SSHtunnel, ntMSSQL_TCPIP];
+      chkWantSSL.Caption := IfThen(Params.IsAnyMSSQL, _('Trust the server certificate (skip verification)'), _('Use SSL'));
+      // The OLE DB driver for MS SQL offers no client key/cert/CA/cipher options and no
+      // "verify CA but not host name" mode, so only the checkbox is relevant there:
+      lblSSLPrivateKey.Enabled := Params.WantSSL and (not Params.IsAnyMSSQL);
+      editSSLPrivateKey.Enabled := Params.WantSSL and (not Params.IsAnyMSSQL);
+      lblSSLCACertificate.Enabled := Params.WantSSL and (not Params.IsAnyMSSQL);
+      editSSLCACertificate.Enabled := Params.WantSSL and (not Params.IsAnyMSSQL);
+      lblSSLCertificate.Enabled := Params.WantSSL and (not Params.IsAnyMSSQL);
+      editSSLCertificate.Enabled := Params.WantSSL and (not Params.IsAnyMSSQL);
+      lblSSLcipher.Enabled := Params.WantSSL and (not Params.IsAnyMSSQL);
+      editSSLcipher.Enabled := Params.WantSSL and (not Params.IsAnyMSSQL);
+      lblSSLVerification.Enabled := Params.WantSSL and (not Params.IsAnyMSSQL);
+      comboSSLVerification.Enabled := Params.WantSSL and (not Params.IsAnyMSSQL);
 
       Params.Free;
     end;
