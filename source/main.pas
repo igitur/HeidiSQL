@@ -2666,9 +2666,22 @@ var
   Connection: TDBConnection;
   Node: PVirtualNode;
   DlgResult: Integer;
+  Tab: TQueryTab;
 begin
   // Disconnect active connection. If it's the last, exit application
   Connection := ActiveConnection;
+  if not Assigned(Connection) then Exit;
+
+  // Refuse to disconnect while a query is running on this connection: closing the
+  // connection under the query thread makes the provider raise an exception, which
+  // leaves the session half-removed. See https://github.com/HeidiSQL/HeidiSQL/issues/316
+  for Tab in QueryTabs do begin
+    if Tab.QueryRunning and (Tab.ExecutionThread.Connection = Connection) then begin
+      LogSQL(_('Cannot disconnect with a running query. Please cancel the query first.'));
+      Exit;
+    end;
+  end;
+
   // Find and remove connection node from tree
   Node := GetRootNode(DBtree, Connection);
   DBTree.DeleteNode(Node);
@@ -2752,7 +2765,14 @@ begin
       // Last chance to access connection related properties before disconnecting
 
       // Disconnect
-      Item.Active := False;
+      try
+        Item.Active := False;
+      except
+        // A broken connection may refuse to close. Do not let that escape as an
+        // unhandled exception, as the session is already removed from the list.
+        on E:Exception do
+          LogSQL(f_('Error when disconnecting: %s', [E.Message]), lcError);
+      end;
     end;
 
     // New connection
@@ -3652,6 +3672,18 @@ begin
   // Clean up
   DisableProgress;
   Tab.QueryRunning := False;
+  if Thread.KilledByServer then begin
+    // actCancelOperationExecute killed the session on the server. Now that the
+    // query thread has released the connection, reconnect it, so the tab does not
+    // keep working with a closed handle. See https://github.com/HeidiSQL/HeidiSQL/issues/316
+    LogSQL(_('Reconnecting session after kill ...'));
+    try
+      Thread.Connection.Ping(True);
+    except
+      on E:Exception do
+        LogSQL(f_('Error when reconnecting: %s', [E.Message]), lcError);
+    end;
+  end;
   ValidateControls(Thread);
   OperationRunning(False);
   Screen.Cursor := crDefault;
@@ -14372,10 +14404,16 @@ end;
 
 
 procedure TMainForm.actCancelOperationExecute(Sender: TObject);
+const
+  // Max time to wait for the server to acknowledge a cancel request, before
+  // additionally killing the session on the server.
+  CancelTimeout = 3000;
 var
-  Killer: TDBConnection;
+  Killer, Conn: TDBConnection;
   KillCommand: String;
   Tab: TQueryTab;
+  CancelStarted: Cardinal;
+  KillAllowed: Boolean;
 begin
   // Stop current operation (sorting grid or running user queries)
   if FOperatingGrid <> nil then begin
@@ -14385,22 +14423,76 @@ begin
   for Tab in QueryTabs do begin
     if Tab.QueryRunning then begin
       Tab.ExecutionThread.Aborted := True;
-      Killer := ActiveConnection.Parameters.CreateConnection(Self);
-      Killer.Parameters := ActiveConnection.Parameters;
-      Killer.OwnsParameters := False;
-      Killer.LogPrefix := _('Helper connection');
-      Killer.OnLog := LogSQL;
-      try
-        Killer.Active := True;
-        KillCommand := Killer.SqlProvider.GetSql(qKillQuery, [ActiveConnection.ThreadId]);
-        Killer.Query(KillCommand);
-      except
-        on E:EDbError do begin
-          MessageDialog(E.Message, mtError, [mbOK]);
+
+      // Use the connection which the query runs on, not the one which is focused
+      // in the database tree, as those differ while a query is running.
+      // See https://github.com/HeidiSQL/HeidiSQL/issues/316
+      Conn := Tab.ExecutionThread.Connection;
+
+      // Preferred way to stop a query: let the connection send a protocol level
+      // cancel (TDS attention on MSSQL), which aborts the running batch while
+      // keeping the session, its transaction and its session options intact.
+      if Conn.CancelQuery then begin
+        // Wait for the server to acknowledge the cancel, instead of additionally
+        // killing a session whose query is already gone. Pump the synchronize
+        // queue only, not all messages, to avoid re-entering this handler.
+        LogSQL(_('Waiting for the server to cancel the query ...'));
+        CancelStarted := GetTickCount;
+        while Tab.QueryRunning and (GetTickCount-CancelStarted < CancelTimeout) do begin
+          Sleep(20);
+          CheckSynchronize;
         end;
       end;
-      Killer.Active := False;
-      Killer.Free;
+
+      if Tab.QueryRunning then begin
+        // Fallback for backends and providers without a client side cancel, and
+        // for servers which do not act on the cancel request: kill the session
+        // from a helper connection.
+        Killer := Conn.Parameters.CreateConnection(Self);
+        Killer.Parameters := Conn.Parameters;
+        Killer.OwnsParameters := False;
+        Killer.LogPrefix := _('Helper connection');
+        Killer.OnLog := LogSQL;
+        try
+          try
+            Killer.Active := True;
+            KillAllowed := True;
+            if Conn.Parameters.NetTypeGroup = ngMSSQL then begin
+              try
+                // KILL on MSSQL requires ALTER ANY CONNECTION, which ordinary logins
+                // do not have. Check that up front, so we can explain the situation
+                // here, instead of forwarding Msg 6102 from the server.
+                KillAllowed := Killer.GetVar('SELECT HAS_PERMS_BY_NAME(NULL, NULL, ''ALTER ANY CONNECTION'')') <> '0';
+              except
+                // Pre-2005 servers do not know HAS_PERMS_BY_NAME. Try KILL anyway.
+              end;
+            end;
+            if KillAllowed then begin
+              KillCommand := Killer.SqlProvider.GetSql(qKillQuery, [Conn.ThreadId]);
+              Killer.Query(KillCommand);
+              // That killed the whole session on the server. Reconnect it as soon
+              // as the query thread has released the connection, in
+              // FinishedQueryExecution.
+              Tab.ExecutionThread.KilledByServer := True;
+            end else begin
+              MessageDialog(
+                _('The server did not cancel the query. Stopping it requires the KILL privilege, which this session does not have.'),
+                mtError, [mbOK]
+              );
+            end;
+          except
+            on E:EDbError do
+              MessageDialog(E.Message, mtError, [mbOK]);
+          end;
+        finally
+          try
+            Killer.Active := False;
+          except
+            // Opening the helper connection may have failed before it got a handle
+          end;
+          Killer.Free;
+        end;
+      end;
     end;
   end;
 end;

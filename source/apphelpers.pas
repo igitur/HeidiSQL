@@ -127,6 +127,7 @@ type
     FBatchInOneGo: Boolean;
     FStopOnErrors: Boolean;
     FAborted: Boolean;
+    FKilledByServer: Boolean;
     FErrorMessage: String;
     FBatchPosition: Integer;
     FQueriesInPacket: Integer;
@@ -149,6 +150,7 @@ type
     property RowsFound: Int64 read FRowsFound;
     property WarningCount: Int64 read FWarningCount;
     property Aborted: Boolean read FAborted write FAborted;
+    property KilledByServer: Boolean read FKilledByServer write FKilledByServer;
     property ErrorMessage: String read FErrorMessage;
     property BatchInOneGo: Boolean read FBatchInOneGo;
     constructor Create(Connection: TDBConnection; Batch: TSQLBatch; TabNumber: Integer);
@@ -3406,6 +3408,7 @@ begin
   inherited Create(False);
   FConnection := Connection;
   FAborted := False;
+  FKilledByServer := False;
   FBatch := Batch;
   FTabNumber := TabNumber;
   FBatchPosition := 0;

@@ -531,6 +531,7 @@ type
       constructor Create(AOwner: TComponent); override;
       destructor Destroy; override;
       procedure Query(SQL: String; DoStoreResult: Boolean=False; LogCategory: TDBLogCategory=lcSQL); overload; virtual;
+      function CancelQuery: Boolean; virtual;
       procedure Query(QueryId: TQueryId); overload;
       procedure Query(QueryId: TQueryId; const Args: array of const); overload;
       procedure Log(Category: TDBLogCategory; Msg: String);
@@ -703,6 +704,7 @@ type
       destructor Destroy; override;
       procedure Query(SQL: String; DoStoreResult: Boolean=False; LogCategory: TDBLogCategory=lcSQL); override;
       function Ping(Reconnect: Boolean): Boolean; override;
+      function CancelQuery: Boolean; override;
       function ConnectionInfo: TStringList; override;
       function GetLastResults: TDBQueryList; override;
       property LastRawResults: TAdoRawResults read FLastRawResults;
@@ -3799,6 +3801,29 @@ begin
 end;
 
 
+{**
+  Send a TDS attention packet to the server, which aborts the batch that is
+  currently running but leaves the session, its transaction and its session
+  options intact. This is what SSMS does when you click its cancel button, and
+  unlike KILL it needs no ALTER ANY CONNECTION permission, which the server
+  denies to ordinary logins with Msg 6102.
+  See https://github.com/HeidiSQL/HeidiSQL/issues/316
+}
+function TAdoDBConnection.CancelQuery: Boolean;
+begin
+  Result := False;
+  if not (Assigned(FAdoHandle) and Active) then Exit;
+  try
+    FAdoHandle.Cancel;
+    Result := True;
+    Log(lcInfo, _('Cancel request sent to server.'));
+  except
+    on E:Exception do
+      Log(lcDebug, f_('Cancelling the query failed: %s', [E.Message]));
+  end;
+end;
+
+
 function TAdoDBConnection.Ping(Reconnect: Boolean): Boolean;
 begin
   Log(lcDebug, 'Ping server ...');
@@ -3906,6 +3931,18 @@ begin
   // Ping server in intervals, without automatically reconnecting
   if Active and (not IsLockedByThread) then
     Ping(False);
+end;
+
+
+{**
+  Abort the query which is currently running on this connection, while keeping
+  the session alive. Backends without a protocol level cancel return False here,
+  so the caller can fall back to killing the session.
+  See https://github.com/HeidiSQL/HeidiSQL/issues/316
+}
+function TDBConnection.CancelQuery: Boolean;
+begin
+  Result := False;
 end;
 
 
