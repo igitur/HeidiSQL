@@ -6,8 +6,29 @@ interface
 
 uses
   SysUtils, Variants, Classes, Math, Graphics, fpjson, jsonparser,
-  Controls, Forms, Dialogs, StdCtrls, ExtCtrls, fphttpclient,
+  Controls, Forms, Dialogs, StdCtrls, ExtCtrls, fphttpclient, Process,
   apphelpers, extra_controls, dbconnection, dbstructures, dbstructures.mysql;
+
+type
+  { Available SQL formatters. The ordinal values are only used for the order of the
+    radio group and the combo box - persisted settings use TReformatterKindToId, so
+    reordering or inserting an entry can never change what a stored value means. }
+  TReformatterKind = (rkInternal, rkHeidiSQLOnline, rkSqlFormatOrg, rkExternal);
+
+const
+  ReformatterKindIds: array[TReformatterKind] of String =
+    ('internal', 'heidisql', 'sqlformat', 'external');
+
+function ReformatterKindToId(Kind: TReformatterKind): String;
+function ReformatterKindById(Id: String): TReformatterKind;
+function ReformatterKindByIndex(Index: Integer): TReformatterKind;
+function ReformatterCaption(Kind: TReformatterKind): String;
+function ReformatterKindStored: TReformatterKind;
+procedure StoreReformatterKind(Kind: TReformatterKind);
+function ReformatterAskStored: Boolean;
+procedure StoreReformatterAsk(Value: Boolean);
+function ReformatterExternalCommandStored: String;
+procedure StoreReformatterExternalCommand(Value: String);
 
 type
   TfrmReformatter = class(TExtForm)
@@ -16,7 +37,11 @@ type
     btnOk: TButton;
     lblFormatProviderLink: TLabel;
     chkKeepAsking: TCheckBox;
+    lblCommandLine: TLabel;
+    edtCommandLine: TEdit;
+    btnCommandLineBrowse: TButton;
     procedure btnOkClick(Sender: TObject);
+    procedure btnCommandLineBrowseClick(Sender: TObject);
     procedure FormCreate(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure grpReformatterClick(Sender: TObject);
@@ -24,11 +49,16 @@ type
   private
     { Private declarations }
     FInputCode, FOutputCode: String;
+    procedure UpdateCommandLineControls;
   public
     { Public declarations }
     function FormatSqlInternal(SQL: String): String;
     function FormatSqlOnlineHeidisql(SQL: String): String;
     function FormatSqlOnlineSqlformatOrg(SQL: String): String;
+    function FormatSqlExternal(SQL: String): String;
+    function SelectedKind: TReformatterKind;
+    function AskBeforeFormatting: Boolean;
+    function ExecuteFormatter: Boolean;
     property InputCode: String read FInputCode write FInputCode;
     property OutputCode: String read FOutputCode;
   end;
@@ -43,85 +73,250 @@ uses main;
 {$R *.lfm}
 
 
-procedure TfrmReformatter.btnOkClick(Sender: TObject);
+function ReformatterKindToId(Kind: TReformatterKind): String;
+begin
+  Result := ReformatterKindIds[Kind];
+end;
+
+
+function ReformatterKindById(Id: String): TReformatterKind;
+var
+  Kind: TReformatterKind;
+begin
+  for Kind := Low(TReformatterKind) to High(TReformatterKind) do begin
+    if SameText(ReformatterKindIds[Kind], Id) then begin
+      Result := Kind;
+      Exit;
+    end;
+  end;
+  // An id written by a newer version, or a corrupted value. Fall back to the
+  // built-in formatter instead of guessing what was meant.
+  Result := rkInternal;
+end;
+
+
+function ReformatterKindByIndex(Index: Integer): TReformatterKind;
+begin
+  if (Index >= Ord(Low(TReformatterKind))) and (Index <= Ord(High(TReformatterKind))) then
+    Result := TReformatterKind(Index)
+  else
+    Result := rkInternal;
+end;
+
+
+function ReformatterCaption(Kind: TReformatterKind): String;
+begin
+  Result := '';
+  case Kind of
+    rkInternal: Result := _('Internal');
+    rkHeidiSQLOnline: Result := f_('Online on %s', [APPDOMAIN]);
+    rkSqlFormatOrg: Result := f_('Online on %s', ['sqlformat.org']);
+    rkExternal: Result := _('External command line tool');
+  end;
+end;
+
+
+procedure MigrateReformatterSettings;
+var
+  LegacyChoice: Integer;
+begin
+  if AppSettings.ValueExists(asReformatterId) then
+    Exit;
+  // Older builds stored the choice as an index into the formatter list, and did so
+  // twice: "Reformatter" (last used in the dialog) and "ReformatterNoDialog"
+  // (0 = always ask, n = formatter n-1). Convert the pair once, and leave the old
+  // values untouched, so a downgrade still finds a usable index.
+  LegacyChoice := AppSettings.ReadInt(asReformatterNoDialog);
+  if LegacyChoice > 0 then begin
+    StoreReformatterKind(ReformatterKindByIndex(LegacyChoice - 1));
+    StoreReformatterAsk(False);
+  end else begin
+    StoreReformatterKind(ReformatterKindByIndex(AppSettings.ReadInt(asReformatter)));
+    StoreReformatterAsk(True);
+  end;
+end;
+
+
+function ReformatterKindStored: TReformatterKind;
+begin
+  MigrateReformatterSettings;
+  Result := ReformatterKindById(AppSettings.ReadString(asReformatterId));
+end;
+
+
+procedure StoreReformatterKind(Kind: TReformatterKind);
+begin
+  AppSettings.WriteString(asReformatterId, ReformatterKindToId(Kind));
+end;
+
+
+function ReformatterAskStored: Boolean;
+begin
+  MigrateReformatterSettings;
+  Result := AppSettings.ReadBool(asReformatterAsk);
+end;
+
+
+procedure StoreReformatterAsk(Value: Boolean);
+begin
+  AppSettings.WriteBool(asReformatterAsk, Value);
+end;
+
+
+function ReformatterExternalCommandStored: String;
+begin
+  Result := AppSettings.ReadString(asReformatterExternalCommand);
+end;
+
+
+procedure StoreReformatterExternalCommand(Value: String);
+begin
+  AppSettings.WriteString(asReformatterExternalCommand, Value);
+end;
+
+
+function TfrmReformatter.SelectedKind: TReformatterKind;
+begin
+  Result := ReformatterKindByIndex(grpReformatter.ItemIndex);
+end;
+
+
+procedure TfrmReformatter.UpdateCommandLineControls;
+var
+  ShowCommandLine: Boolean;
+begin
+  ShowCommandLine := SelectedKind = rkExternal;
+  lblCommandLine.Visible := ShowCommandLine;
+  edtCommandLine.Visible := ShowCommandLine;
+  btnCommandLineBrowse.Visible := ShowCommandLine;
+end;
+
+
+function TfrmReformatter.AskBeforeFormatting: Boolean;
+begin
+  Result := ReformatterAskStored
+    // An external formatter without a command line cannot run, so ask in that case
+    // even if the user asked not to be asked again.
+    or ((SelectedKind = rkExternal) and (Trim(edtCommandLine.Text) = ''));
+end;
+
+
+function TfrmReformatter.ExecuteFormatter: Boolean;
 var
   StartTime: UInt64;
   TimeElapsed: Double;
 begin
+  // Clear the previous result first: an empty OutputCode is what tells the caller
+  // that formatting failed, and then it must leave the editor content alone.
+  FOutputCode := '';
   Screen.Cursor := crHourGlass;
   try
     StartTime := GetTickCount64;
-    case grpReformatter.ItemIndex of
-      0: begin
-        // Internal
-        FOutputCode := FormatSqlInternal(FInputCode);
-      end;
-      1: begin
-        // Online
-        FOutputCode := FormatSqlOnlineHeidisql(FInputCode);
-      end;
-      2: begin
-        // sqlformat.org
-        FOutputCode := FormatSqlOnlineSqlformatOrg(FInputCode);
-      end;
+    case SelectedKind of
+      rkInternal: FOutputCode := FormatSqlInternal(FInputCode);
+      rkHeidiSQLOnline: FOutputCode := FormatSqlOnlineHeidisql(FInputCode);
+      rkSqlFormatOrg: FOutputCode := FormatSqlOnlineSqlformatOrg(FInputCode);
+      rkExternal: FOutputCode := FormatSqlExternal(FInputCode);
     end;
     // Unify line breaks, so selection end will be correct:
     FOutputCode := fixNewlines(FOutputCode);
     TimeElapsed := GetTickCount64 - StartTime;
-    MainForm.LogSQL(f_('Code reformatted in %s, using formatter %s', [FormatTimeNumber(TimeElapsed/1000, True, 3), '#'+grpReformatter.ItemIndex.ToString]));
+    MainForm.LogSQL(f_('Code reformatted in %s, using formatter %s',
+      [FormatTimeNumber(TimeElapsed/1000, True, 3), ReformatterKindToId(SelectedKind)]));
+    Result := FOutputCode <> '';
+    if not Result then
+      ErrorDialog(_('The formatter returned an empty result.'));
   except
     on E:Exception do begin
+      FOutputCode := '';
+      Result := False;
       ErrorDialog(E.ClassName + ': ' + E.Message);
-      ModalResult := mrNone;
     end;
-
   end;
-
-  if not chkKeepAsking.Checked then begin
-    // No dialog next time please
-    AppSettings.WriteInt(asReformatterNoDialog, grpReformatter.ItemIndex+1);
-  end;
-
   Screen.Cursor := crDefault;
 end;
 
-procedure TfrmReformatter.FormCreate(Sender: TObject);
+
+procedure TfrmReformatter.btnOkClick(Sender: TObject);
 begin
-  grpReformatter.Items.Clear;
-  grpReformatter.Items.Add(_('Internal'));
-  grpReformatter.Items.Add(f_('Online on %s', [APPDOMAIN]));
-  grpReformatter.Items.Add(f_('Online on %s', ['sqlformat.org']));
-  if AppSettings.ReadInt(asReformatterNoDialog) = 0 then begin
-    grpReformatter.ItemIndex := AppSettings.ReadInt(asReformatter);
-  end
-  else begin
-    // asReformatterNoDialog has the same items with an additional "always ask" item at index 0
-    grpReformatter.ItemIndex := AppSettings.ReadInt(asReformatterNoDialog) - 1;
+  if SelectedKind = rkExternal then begin
+    if Trim(edtCommandLine.Text) = '' then begin
+      ErrorDialog(_('Please specify the command line of the external formatter.'));
+      ModalResult := mrNone;
+      Exit;
+    end;
+    StoreReformatterExternalCommand(Trim(edtCommandLine.Text));
   end;
+  if ExecuteFormatter then begin
+    StoreReformatterAsk(chkKeepAsking.Checked);
+    ModalResult := mrOk;
+  end else
+    ModalResult := mrNone;
+end;
+
+
+procedure TfrmReformatter.btnCommandLineBrowseClick(Sender: TObject);
+var
+  Dialog: TOpenDialog;
+begin
+  Dialog := TOpenDialog.Create(Self);
+  try
+    Dialog.Title := _('Select the executable of the external formatter');
+    Dialog.Options := [ofFileMustExist];
+    if Dialog.Execute then
+      edtCommandLine.Text := Dialog.FileName;
+  finally
+    Dialog.Free;
+  end;
+end;
+
+
+procedure TfrmReformatter.FormCreate(Sender: TObject);
+var
+  Kind: TReformatterKind;
+begin
+  // Single source of truth for the formatter list: the combo box in Preferences
+  // copies these items, so an item index always maps to the same TReformatterKind.
+  grpReformatter.Items.Clear;
+  for Kind := Low(TReformatterKind) to High(TReformatterKind) do
+    grpReformatter.Items.Add(ReformatterCaption(Kind));
+  grpReformatter.ItemIndex := Ord(ReformatterKindStored);
+  edtCommandLine.Text := ReformatterExternalCommandStored;
+  chkKeepAsking.Checked := ReformatterAskStored;
+  grpReformatterClick(Self);
   lblFormatProviderLink.Font.Style := lblFormatProviderLink.Font.Style + [fsUnderline];
 end;
 
 procedure TfrmReformatter.FormDestroy(Sender: TObject);
 begin
-  AppSettings.WriteInt(asReformatter, grpReformatter.ItemIndex);
+  // Remember the last used formatter and its command line, regardless of whether
+  // the dialog was confirmed. Whether to ask again at all is stored by btnOkClick.
+  StoreReformatterKind(SelectedKind);
+  StoreReformatterExternalCommand(Trim(edtCommandLine.Text));
 end;
 
 
 procedure TfrmReformatter.grpReformatterClick(Sender: TObject);
 begin
-  case grpReformatter.ItemIndex of
-    0: lblFormatProviderLink.Visible := False;
-    1: begin
+  case SelectedKind of
+    rkInternal: begin
+      lblFormatProviderLink.Visible := False;
+    end;
+    rkHeidiSQLOnline: begin
       lblFormatProviderLink.Caption := 'github.com/doctrine/sql-formatter (Jeremy Dorn)';
       lblFormatProviderLink.Hint := 'https://github.com/doctrine/sql-formatter';
       lblFormatProviderLink.Visible := True;
     end;
-    2: begin
+    rkSqlFormatOrg: begin
       lblFormatProviderLink.Caption := 'SQLFormat.org (Andi Albrecht)';
       lblFormatProviderLink.Hint := 'https://sqlformat.org/';
       lblFormatProviderLink.Visible := True;
     end;
+    rkExternal: begin
+      lblFormatProviderLink.Visible := False;
+    end;
   end;
+  UpdateCommandLineControls;
 end;
 
 procedure TfrmReformatter.lblFormatProviderLinkClick(Sender: TObject);
@@ -287,6 +482,144 @@ begin
   JsonTmp.Free;
   JsonParser.Free;
   HttpReq.Free;
+end;
+
+{**
+  Splits a command line into arguments, honouring double quoted parts, so that
+  "C:\Some Path\formatter.exe" --option "some value" works as expected.
+  TProcess.CommandLine does the same, but is deprecated.
+}
+procedure SplitReformatterCommandLine(Command: String; Arguments: TStrings);
+var
+  i: Integer;
+  Current: String;
+  InQuote: Boolean;
+begin
+  Arguments.Clear;
+  Current := '';
+  InQuote := False;
+  for i := 1 to Length(Command) do begin
+    case Command[i] of
+      '"': InQuote := not InQuote;
+      ' ', #9:
+        if InQuote then
+          Current := Current + Command[i]
+        else begin
+          if Current <> '' then begin
+            Arguments.Add(Current);
+            Current := '';
+          end;
+        end;
+      else
+        Current := Current + Command[i];
+    end;
+  end;
+  if Current <> '' then
+    Arguments.Add(Current);
+end;
+
+
+{**
+  Runs the configured external command line formatter. The SQL is written to the
+  process' stdin and the formatted SQL is expected on its stdout, which is what
+  command line formatters like sleek, sql-formatter or pgFormatter do.
+}
+function TfrmReformatter.FormatSqlExternal(SQL: String): String;
+var
+  Proc: TProcess;
+  Command: String;
+  CommandArguments: TStringList;
+  Buffer: array[0..4095] of Byte;
+  Chunk, Position, i: Integer;
+  Output: TMemoryStream;
+  Started, TimeoutMs: Int64;
+
+  procedure DrainOutput;
+  var
+    ReadCount: LongInt;
+  begin
+    // Read whatever is available without blocking, so a formatter which writes a
+    // lot of output while we are still feeding it cannot fill up the pipe.
+    while Proc.Output.NumBytesAvailable > 0 do begin
+      ReadCount := Proc.Output.Read(Buffer, SizeOf(Buffer));
+      if ReadCount <= 0 then
+        Break;
+      Output.WriteBuffer(Buffer, ReadCount);
+    end;
+  end;
+
+begin
+  Result := '';
+  Command := Trim(edtCommandLine.Text);
+  if Command = '' then
+    raise Exception.Create(_('No command line configured for the external formatter'));
+
+  TimeoutMs := AppSettings.ReadInt(asReformatterTimeout) * 1000;
+  if TimeoutMs <= 0 then
+    TimeoutMs := 15000;
+
+  CommandArguments := TStringList.Create;
+  Output := TMemoryStream.Create;
+  Proc := TProcess.Create(nil);
+  try
+    SplitReformatterCommandLine(Command, CommandArguments);
+    if CommandArguments.Count = 0 then
+      raise Exception.Create(_('No command line configured for the external formatter'));
+
+    Proc.Options := [poUsePipes];
+    {$IFDEF WINDOWS}
+    // No console window flashing up while the formatter works
+    Proc.Options := Proc.Options + [poNoConsole];
+    {$ENDIF}
+    Proc.Executable := CommandArguments[0];
+    for i := 1 to CommandArguments.Count-1 do
+      Proc.Parameters.Add(CommandArguments[i]);
+    Proc.Execute;
+    try
+      // Feed the SQL to stdin, draining output in between
+      Position := 1;
+      while Position <= Length(SQL) do begin
+        Chunk := Min(1024, Length(SQL) - Position + 1);
+        Proc.Input.WriteBuffer(SQL[Position], Chunk);
+        Inc(Position, Chunk);
+        DrainOutput;
+      end;
+      try
+        Proc.CloseInput;
+      except
+        // The process may have exited already, e.g. when it rejects its arguments
+      end;
+
+      Started := GetTickCount64;
+      while Proc.Running do begin
+        DrainOutput;
+        Sleep(10);
+        if GetTickCount64 - Started > TimeoutMs then begin
+          Proc.Terminate(1);
+          raise Exception.Create(f_('The external formatter did not finish within %d seconds',
+            [TimeoutMs div 1000]));
+        end;
+      end;
+      DrainOutput;
+
+      if Proc.ExitStatus <> 0 then
+        raise Exception.Create(f_('%s exited with code %d, so its output is not used',
+          [ExtractFileName(Command), Proc.ExitStatus]));
+
+      if Output.Size > 0 then begin
+        SetLength(Result, Output.Size);
+        Output.Position := 0;
+        Output.ReadBuffer(Result[1], Output.Size);
+      end;
+    finally
+      // Release the pipes even when an exception is on its way out
+      Proc.Terminate(0);
+    end;
+  finally
+    Proc.Free;
+    Output.Free;
+    CommandArguments.Free;
+  end;
 end;
 
 end.

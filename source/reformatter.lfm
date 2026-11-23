@@ -1,11 +1,11 @@
 object frmReformatter: TfrmReformatter
   Left = 0
-  Height = 217
+  Height = 262
   Top = 0
   Width = 503
   BorderStyle = bsDialog
   Caption = 'Reformat SQL'
-  ClientHeight = 217
+  ClientHeight = 262
   ClientWidth = 503
   Color = clBtnFace
   Position = poOwnerFormCenter
@@ -42,7 +42,7 @@ object frmReformatter: TfrmReformatter
   object btnCancel: TButton
     Left = 420
     Height = 25
-    Top = 184
+    Top = 229
     Width = 75
     Anchors = [akRight, akBottom]
     BorderSpacing.Around = 5
@@ -54,7 +54,7 @@ object frmReformatter: TfrmReformatter
   object btnOk: TButton
     Left = 339
     Height = 25
-    Top = 184
+    Top = 229
     Width = 75
     Anchors = [akRight, akBottom]
     Caption = 'OK'
@@ -69,7 +69,7 @@ object frmReformatter: TfrmReformatter
     Cursor = crHandPoint
     Left = 8
     Height = 15
-    Top = 151
+    Top = 141
     Width = 117
     Anchors = [akLeft, akBottom]
     Caption = 'lblFormatProviderLink'
@@ -79,12 +79,40 @@ object frmReformatter: TfrmReformatter
   object chkKeepAsking: TCheckBox
     Left = 8
     Height = 19
-    Top = 186
+    Top = 231
     Width = 257
     Anchors = [akLeft, akRight, akBottom]
     Caption = 'Keep asking this question.'
     Checked = True
     State = cbChecked
     TabOrder = 3
+  end
+  object lblCommandLine: TLabel
+    Left = 8
+    Height = 15
+    Top = 162
+    Width = 138
+    Caption = 'External command line:'
+    Visible = False
+  end
+  object edtCommandLine: TEdit
+    Left = 8
+    Height = 23
+    Top = 180
+    Width = 410
+    Anchors = [akTop, akLeft, akRight]
+    TabOrder = 4
+    Visible = False
+  end
+  object btnCommandLineBrowse: TButton
+    Left = 424
+    Height = 25
+    Top = 179
+    Width = 71
+    Anchors = [akTop, akRight]
+    Caption = '...'
+    OnClick = btnCommandLineBrowseClick
+    TabOrder = 5
+    Visible = False
   end
 end

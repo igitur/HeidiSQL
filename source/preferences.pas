@@ -406,7 +406,13 @@ begin
   AppSettings.WriteBool(asTabCloseOnDoubleClick, chkTabCloseOnDoubleClick.Checked);
   AppSettings.WriteBool(asTabCloseOnMiddleClick, chkTabCloseOnMiddleClick.Checked);
   AppSettings.WriteInt(asTabIconsGrayscaleMode, comboTabIconsGrayscaleMode.ItemIndex);
-  AppSettings.WriteInt(asReformatterNoDialog, comboReformatter.ItemIndex);
+  // Item 0 is "Always ask", the rest map to a formatter kind
+  if comboReformatter.ItemIndex = 0 then
+    StoreReformatterAsk(True)
+  else begin
+    StoreReformatterAsk(False);
+    StoreReformatterKind(ReformatterKindByIndex(comboReformatter.ItemIndex - 1));
+  end;
   AppSettings.WriteString(asCustomSnippetsDirectory, editCustomSnippetsDirectory.Text);
 
   // Set relevant properties in mainform
@@ -769,7 +775,11 @@ begin
   chkTabCloseOnDoubleClick.Checked := AppSettings.ReadBool(asTabCloseOnDoubleClick);
   chkTabCloseOnMiddleClick.Checked := AppSettings.ReadBool(asTabCloseOnMiddleClick);
   comboTabIconsGrayscaleMode.ItemIndex := AppSettings.ReadInt(asTabIconsGrayscaleMode);
-  comboReformatter.ItemIndex := AppSettings.ReadInt(asReformatterNoDialog);
+  // Item 0 is "Always ask", the rest map to a formatter kind
+  if ReformatterAskStored then
+    comboReformatter.ItemIndex := 0
+  else
+    comboReformatter.ItemIndex := Ord(ReformatterKindStored) + 1;
   editCustomSnippetsDirectory.Text := AppSettings.ReadString(asCustomSnippetsDirectory);
 
   // Disable global shortcuts

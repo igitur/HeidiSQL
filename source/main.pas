@@ -14119,14 +14119,13 @@ begin
   else begin
     frmReformatter := TfrmReformatter.Create(Self);
     frmReformatter.InputCode := m.SelText;
-    if AppSettings.ReadInt(asReformatterNoDialog) <> 0 then begin
-      frmReformatter.btnOkClick(Self);
-      Done := True;
-    end
-    else begin
-      Done := frmReformatter.ShowModal = mrOk;
-    end;
-    if Done then begin
+    if frmReformatter.AskBeforeFormatting then
+      Done := frmReformatter.ShowModal = mrOk
+    else
+      Done := frmReformatter.ExecuteFormatter;
+    // Never overwrite the selection when the formatter failed or returned nothing:
+    // the user would silently lose the query they tried to format.
+    if Done and (frmReformatter.OutputCode <> '') then begin
       Screen.Cursor := crHourglass;
       //m.UndoList.AddGroupBreak;
       m.SelText := frmReformatter.OutputCode;

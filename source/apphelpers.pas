@@ -259,7 +259,8 @@ type
     asFileDialogSortColumn, asFileDialogSortDescending, asFileDialogRecentFolders,
     asThemePreviewWidth, asThemePreviewHeight, asThemePreviewTop, asThemePreviewLeft,
     asCreateDbCollation, asRealTrailingZeros,
-    asReformatter, asReformatterNoDialog, asAlwaysGenerateFilter, asDisplayReverseForeignKeys,
+    asReformatter, asReformatterNoDialog, asReformatterId, asReformatterAsk,
+    asReformatterExternalCommand, asReformatterTimeout, asAlwaysGenerateFilter, asDisplayReverseForeignKeys,
     asGenerateDataNumRows, asGenerateDataNullAmount, asWebOnceAction, asDisplayLogPanel, asDisplayTreeFilters,
     asUnused);
   TAppSetting = record
@@ -4263,8 +4264,14 @@ begin
   InitSetting(asDisplayBars,                      'DisplayBars',                           0, true);
   InitSetting(asMySQLBinaries,                    'MySQL_Binaries',                        0, False, '');
   InitSetting(asTerminal,                         'Terminal',                              0, False, '');
+  // Legacy, superseded by asReformatterId and asReformatterAsk below. Kept in the
+  // list so old values can be migrated; see MigrateReformatterSettings in reformatter.pas
   InitSetting(asReformatter,                      'Reformatter',                           0);
   InitSetting(asReformatterNoDialog,              'ReformatterNoDialog',                   0);
+  InitSetting(asReformatterId,                    'ReformatterId',                         0, False, 'internal');
+  InitSetting(asReformatterAsk,                   'ReformatterAsk',                        0, True);
+  InitSetting(asReformatterExternalCommand,       'ReformatterExternalCommand',            0, False, '');
+  InitSetting(asReformatterTimeout,               'ReformatterTimeout',                    15);
   InitSetting(asAlwaysGenerateFilter,             'AlwaysGenerateFilter',                  0, False);
   InitSetting(asDisplayReverseForeignKeys,        'DisplayReverseForeignKeys',             0, False);
   InitSetting(asGenerateDataNumRows,              'GenerateDataNumRows',                   1000);
