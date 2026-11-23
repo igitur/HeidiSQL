@@ -267,6 +267,7 @@ procedure TfrmUpdateCheck.btnBuildClick(Sender: TObject);
 var
   Download: THttpDownLoad;
   ExeName, DownloadFilename, UpdaterFilename: String;
+  UpdaterParams: String;
   ResInfoblockHandle: HRSRC;
   ResHandle: THandle;
   ResPointer: PChar;
@@ -323,7 +324,14 @@ begin
         end;
 
         // Calling the script will now post a WM_CLOSE this running exe...
-        ShellExec(UpdaterFilename, '', '"'+ParamStr(0)+'" "'+DownloadFilename+'" "'+FRestartTaskName+'"');
+        UpdaterParams := '"'+ParamStr(0)+'" "'+DownloadFilename+'" "'+FRestartTaskName+'"';
+        // The updater is manifested asInvoker, so it only needs to be started elevated
+        // when it has to write into the application directory. Keeping it elevated if
+        // this process already is matters as well: an unelevated updater could neither
+        // close an elevated HeidiSQL window (UIPI) nor replace its running executable.
+        // See https://github.com/HeidiSQL/HeidiSQL/issues/2305
+        if not ShellExecEx(UpdaterFilename, UpdaterParams, (not AppDirIsWritable) or IsProcessElevated) then
+          Status(_('Cannot start the updater. See the log for details.'));
       finally
         UnlockResource(ResHandle);
         FreeResource(ResHandle);

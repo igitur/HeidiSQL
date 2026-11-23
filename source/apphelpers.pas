@@ -353,6 +353,8 @@ type
   function FormatNumber( int: Int64; Thousands: Boolean=True): String; Overload;
   function FormatNumber( flt: Double; decimals: Integer = 0; Thousands: Boolean=True): String; Overload;
   procedure ShellExec(cmd: String; path: String=''; params: String=''; RunHidden: Boolean=False);
+  function ShellExecEx(const Filename, Params: String; RunElevated: Boolean): Boolean;
+  function IsProcessElevated: Boolean;
   function getFirstWord(text: String; MustStartWithWordChar: Boolean=True): String;
   function RegExprGetMatch(Expression: String; var Input: String; ReturnMatchNum: Integer; DeleteFromSource, CaseInsensitive: Boolean): String; Overload;
   function RegExprGetMatch(Expression: String; Input: String; ReturnMatchNum: Integer): String; Overload;
@@ -1124,6 +1126,71 @@ begin
     Msg := Msg + ' params: "'+params+'"';
   MainForm.LogSQL(Msg, lcDebug);
   ShellExecute(0, 'open', PChar(cmd), PChar(params), PChar(path), ShowCmd);
+end;
+
+
+{***
+  Run a program, optionally through the UAC elevation prompt.
+
+  Unlike ShellExec this returns whether the process was started at all, and it can
+  request elevation with the "runas" verb - which is the documented way to elevate
+  a helper process on demand, so that the program itself can be manifested asInvoker.
+  Returns False if the process was not started, e.g. when the user dismissed the
+  elevation prompt; GetLastError then returns ERROR_CANCELLED.
+  See https://github.com/HeidiSQL/HeidiSQL/issues/2305
+
+  @param string  Executable to run
+  @param string  Command line parameters
+  @param boolean Start the process with an elevated token
+}
+function ShellExecEx(const Filename, Params: String; RunElevated: Boolean): Boolean;
+var
+  ExecInfo: TShellExecuteInfo;
+  ErrorCode: Cardinal;
+begin
+  FillChar(ExecInfo, SizeOf(ExecInfo), 0);
+  ExecInfo.cbSize := SizeOf(ExecInfo);
+  ExecInfo.fMask := SEE_MASK_NOCLOSEPROCESS or SEE_MASK_FLAG_NO_UI;
+  ExecInfo.Wnd := GetActiveWindow;
+  if RunElevated then
+    ExecInfo.lpVerb := 'runas'
+  else
+    ExecInfo.lpVerb := 'open';
+  ExecInfo.lpFile := PChar(Filename);
+  ExecInfo.lpParameters := PChar(Params);
+  ExecInfo.lpDirectory := PChar(ExtractFilePath(Filename));
+  ExecInfo.nShow := SW_SHOWNORMAL;
+  Result := ShellExecuteEx(@ExecInfo);
+  if Result then begin
+    if ExecInfo.hProcess <> 0 then
+      CloseHandle(ExecInfo.hProcess);
+  end else begin
+    ErrorCode := GetLastError;
+    MainForm.LogSQL(f_('Cannot execute "%s": %s', [Filename, SysErrorMessage(ErrorCode)]), lcError);
+  end;
+end;
+
+
+{***
+  Returns True if the current process runs with an elevated (administrator) token.
+}
+function IsProcessElevated: Boolean;
+var
+  Token: THandle;
+  Elevation: DWORD;
+  ReturnLength: DWORD;
+begin
+  Result := False;
+  if not OpenProcessToken(GetCurrentProcess, TOKEN_QUERY, Token) then
+    Exit;
+  try
+    ReturnLength := 0;
+    // TokenElevation from TOKEN_INFORMATION_CLASS. It is a DWORD, not a BOOL.
+    if GetTokenInformation(Token, TokenElevation, @Elevation, SizeOf(Elevation), ReturnLength) then
+      Result := Elevation <> 0;
+  finally
+    CloseHandle(Token);
+  end;
 end;
 
 
