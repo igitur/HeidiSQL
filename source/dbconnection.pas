@@ -5,7 +5,7 @@ interface
 uses
   System.Classes, System.SysUtils, Winapi.Windows, System.Generics.Collections, System.Generics.Defaults,
   System.DateUtils, System.Types, System.Math, Vcl.Dialogs, Data.Win.ADODB, Data.DB, Data.DBCommon, System.Win.ComObj, Vcl.Graphics, Vcl.ExtCtrls, System.StrUtils,
-  System.AnsiStrings, Vcl.Controls, Vcl.Forms, System.IOUtils, System.IniFiles, System.Variants, Rtti,
+  System.AnsiStrings, Vcl.Controls, Vcl.Forms, System.IOUtils, System.IniFiles, System.Variants, Rtti, System.Win.Registry,
   SynRegExpr, gnugettext, generic_types,
   dbstructures, dbstructures.mysql, dbstructures.mssql, dbstructures.postgresql, dbstructures.sqlite, dbstructures.interbase,
   FireDAC.Stan.Intf, FireDAC.Stan.Option,
@@ -1036,6 +1036,301 @@ var
 implementation
 
 uses apphelpers, loginform, change_password;
+
+
+{ SQL Server LocalDB support, see https://github.com/HeidiSQL/HeidiSQL/issues/1756 }
+{
+  A LocalDB instance is reachable only through a named pipe, and SqlLocalDB picks a
+  new pipe name every time the instance starts. Users therefore enter the instance
+  in the host name field, in the form "(localdb)\InstanceName", and the pipe is
+  resolved here on every connection attempt.
+}
+
+const
+  LocalDbHostnamePrefix = '(localdb)';
+  // SqlLocalDB accepts "." for the default instance
+  LocalDbDefaultInstance = 'MSSqlLocalDB';
+  // One subkey per installed LocalDB version, each holding an InstanceAPIPath value
+  LocalDbRegistryVersions = 'SOFTWARE\Microsoft\Microsoft SQL Server Local DB\Installed Versions';
+  LocalDbInfoTimeout = 15000;
+  LocalDbStartTimeout = 60000;
+
+
+{** Returns True when the given host name asks for an SQL Server LocalDB instance }
+function IsLocalDbHostname(const Hostname: String): Boolean;
+begin
+  Result := SameText(Hostname, LocalDbHostnamePrefix)
+    or Hostname.StartsWith(LocalDbHostnamePrefix + '\', True);
+end;
+
+
+{** Extracts the instance name from a LocalDB host name, applying the default instance }
+function LocalDbInstanceName(const Hostname: String): String;
+begin
+  Result := Trim(Copy(Hostname, Length(LocalDbHostnamePrefix)+1, MaxInt));
+  while Result.StartsWith('\') or Result.StartsWith('/') do
+    Delete(Result, 1, 1);
+  Result := Trim(Result);
+  if (Result = '') or (Result = '.') then
+    Result := LocalDbDefaultInstance;
+end;
+
+
+{**
+  Runs a command line and returns what it writes to stdout and stderr. Used for the
+  short-lived SqlLocalDB.exe calls, which need nothing more than "wait and collect".
+}
+function RunCaptureOutput(const CommandLine: String; TimeoutMs: Cardinal; out ExitCode: Cardinal): String;
+var
+  SecurityAttributes: TSecurityAttributes;
+  ReadHandle, WriteHandle: THandle;
+  StartupInfo: TStartupInfo;
+  ProcessInfo: TProcessInformation;
+  Available, ReadNow: Cardinal;
+  Buffer: array[0..1023] of AnsiChar;
+  Output: AnsiString;
+  Started: UInt64;
+  Finished: Boolean;
+
+  procedure DrainPipe;
+  begin
+    while PeekNamedPipe(ReadHandle, nil, 0, nil, @Available, nil) and (Available > 0) do begin
+      ReadNow := 0;
+      if (not ReadFile(ReadHandle, Buffer, SizeOf(Buffer), ReadNow, nil)) or (ReadNow = 0) then
+        Break;
+      SetLength(Output, Length(Output) + Integer(ReadNow));
+      Move(Buffer, Output[Length(Output)-Integer(ReadNow)+1], ReadNow);
+    end;
+  end;
+
+begin
+  Result := '';
+  ExitCode := Cardinal(-1);
+  Output := '';
+  WriteHandle := 0;
+  ZeroMemory(@ProcessInfo, SizeOf(ProcessInfo));
+
+  ZeroMemory(@SecurityAttributes, SizeOf(SecurityAttributes));
+  SecurityAttributes.nLength := SizeOf(SecurityAttributes);
+  SecurityAttributes.bInheritHandle := True;
+  if not CreatePipe(ReadHandle, WriteHandle, @SecurityAttributes, 0) then
+    raise EDbError.Create(f_('Cannot create a pipe for %s: %s', [ExtractFileName(CommandLine), SysErrorMessage(GetLastError)]));
+  try
+    // The read end stays in this process, the write end is inherited by the child
+    SetHandleInformation(ReadHandle, HANDLE_FLAG_INHERIT, 0);
+
+    ZeroMemory(@StartupInfo, SizeOf(StartupInfo));
+    StartupInfo.cb := SizeOf(StartupInfo);
+    StartupInfo.dwFlags := STARTF_USESHOWWINDOW or STARTF_USESTDHANDLES;
+    StartupInfo.wShowWindow := SW_HIDE;
+    StartupInfo.hStdOutput := WriteHandle;
+    StartupInfo.hStdError := WriteHandle;
+
+    if not CreateProcess(nil, PChar(CommandLine), nil, nil, True,
+      CREATE_NO_WINDOW or NORMAL_PRIORITY_CLASS, nil, nil, StartupInfo, ProcessInfo) then
+      raise EDbError.Create(f_('Cannot execute %s: %s', [CommandLine, SysErrorMessage(GetLastError)]));
+    // Our copy of the write end has to go, otherwise the pipe never reports EOF
+    CloseHandle(WriteHandle);
+    WriteHandle := 0;
+
+    Started := GetTickCount64;
+    repeat
+      DrainPipe;
+      Finished := WaitForSingleObject(ProcessInfo.hProcess, 20) = WAIT_OBJECT_0;
+      if (not Finished) and (GetTickCount64-Started > TimeoutMs) then begin
+        TerminateProcess(ProcessInfo.hProcess, 1);
+        raise EDbError.Create(f_('Timeout while executing %s after %d ms', [ExtractFileName(CommandLine), TimeoutMs]));
+      end;
+    until Finished;
+    // Collect what the child wrote just before it exited
+    DrainPipe;
+    GetExitCodeProcess(ProcessInfo.hProcess, ExitCode);
+    // SqlLocalDB.exe only writes ASCII
+    Result := Trim(Output);
+  finally
+    if WriteHandle <> 0 then
+      CloseHandle(WriteHandle);
+    if ProcessInfo.hThread <> 0 then
+      CloseHandle(ProcessInfo.hThread);
+    if ProcessInfo.hProcess <> 0 then
+      CloseHandle(ProcessInfo.hProcess);
+    CloseHandle(ReadHandle);
+  end;
+end;
+
+
+{**
+  Returns the first "Name: value" line of the given SqlLocalDB output, or an empty
+  string when the name does not occur.
+}
+function LocalDbStatValue(const Output, Name: String): String;
+var
+  Lines: TStringList;
+  i: Integer;
+begin
+  Result := '';
+  Lines := TStringList.Create;
+  try
+    Lines.Text := Output;
+    for i := 0 to Lines.Count-1 do begin
+      if Lines[i].TrimLeft.StartsWith(Name + ':', True) then begin
+        Result := Trim(Copy(Lines[i], Pos(':', Lines[i])+1, MaxInt));
+        Exit;
+      end;
+    end;
+  finally
+    Lines.Free;
+  end;
+end;
+
+
+{**
+  Finds SqlLocalDB.exe. The PATH environment variable comes first, so a user can
+  deliberately point at one of several installed versions. Without a PATH match the
+  registry is used, preferring the highest installed version.
+}
+function FindSqlLocalDbExecutable: String;
+var
+  Directories, Versions: TStringList;
+  i: Integer;
+  Directory, ApiPath, ToolsDirectory: String;
+  Reg: TRegistry;
+begin
+  Result := '';
+
+  Directories := Explode(';', GetEnvironmentVariable('PATH'));
+  try
+    for i := 0 to Directories.Count-1 do begin
+      Directory := Trim(Directories[i]);
+      if Directory = '' then
+        Continue;
+      Directory := IncludeTrailingPathDelimiter(Directory);
+      if FileExists(Directory + 'SqlLocalDB.exe') then begin
+        Result := Directory + 'SqlLocalDB.exe';
+        Exit;
+      end;
+    end;
+  finally
+    Directories.Free;
+  end;
+
+  Versions := TStringList.Create;
+  // Read the 64 bit view on purpose: LocalDB is normally installed as 64 bit, and
+  // a 32 bit HeidiSQL would otherwise look into WOW6432Node and find nothing.
+  Reg := TRegistry.Create(KEY_READ or KEY_WOW64_64KEY);
+  try
+    Reg.RootKey := HKEY_LOCAL_MACHINE;
+    if not Reg.OpenKeyReadOnly(LocalDbRegistryVersions) then
+      Exit;
+    Reg.GetKeyNames(Versions);
+    Reg.CloseKey;
+    // Version names sort ascending, so the largest version comes last
+    Versions.Sort;
+    for i := Versions.Count-1 downto 0 do begin
+      if not Reg.OpenKeyReadOnly(LocalDbRegistryVersions + '\' + Versions[i]) then
+        Continue;
+      ApiPath := Reg.ReadString('InstanceAPIPath');
+      Reg.CloseKey;
+      if not ApiPath.EndsWith('\LocalDB\Binn\SqlUserInstance.dll', True) then
+        Continue;
+      // ...\150\LocalDB\Binn\SqlUserInstance.dll -> ...\150\Tools\Binn\
+      ToolsDirectory := Copy(ApiPath, 1, Length(ApiPath)-Length('\LocalDB\Binn\SqlUserInstance.dll')) + '\Tools\Binn\';
+      if FileExists(ToolsDirectory + 'SqlLocalDB.exe') then begin
+        Result := ToolsDirectory + 'SqlLocalDB.exe';
+        Exit;
+      end;
+    end;
+  finally
+    Reg.Free;
+    Versions.Free;
+  end;
+end;
+
+
+{**
+  Resolves a "(localdb)\InstanceName" host name to the named pipe that instance is
+  currently listening on, starting the instance when it is not running.
+
+  Returns False when the host name does not ask for LocalDB. Raises EDbError when it
+  does, but the instance cannot be found or started.
+}
+function ResolveLocalDbPipe(Connection: TDBConnection; const Hostname: String; out PipeName: String): Boolean;
+var
+  Instance, Executable, Output, State, Available: String;
+  ExitCode: Cardinal;
+  Lines: TStringList;
+  i: Integer;
+  Found: Boolean;
+begin
+  PipeName := '';
+  Result := IsLocalDbHostname(Hostname);
+  if not Result then
+    Exit;
+
+  Instance := LocalDbInstanceName(Hostname);
+  Executable := FindSqlLocalDbExecutable;
+  if Executable = '' then
+    raise EDbError.Create(
+      _('SqlLocalDB.exe was not found.'),
+      0,
+      _('Install "SQL Server Express LocalDB", or add the Tools\Binn directory of an installed LocalDB version to the PATH environment variable.')
+    );
+  Executable := '"' + Executable + '"';
+
+  Output := RunCaptureOutput(Executable + ' info', LocalDbInfoTimeout, ExitCode);
+  Found := False;
+  Available := '';
+  Lines := TStringList.Create;
+  try
+    Lines.Text := Output;
+    for i := 0 to Lines.Count-1 do begin
+      if Lines[i].Trim.IsEmpty then
+        Continue;
+      if not Available.IsEmpty then
+        Available := Available + ', ';
+      Available := Available + Lines[i].Trim;
+      if SameText(Lines[i].Trim, Instance) then
+        Found := True;
+    end;
+  finally
+    Lines.Free;
+  end;
+  if not Found then
+    raise EDbError.Create(
+      f_('LocalDB instance "%s" does not exist.', [Instance]),
+      0,
+      f_('Known instances: %s', [IfThen(not Available.IsEmpty, Available, _('none'))])
+    );
+
+  // A stopped instance has no pipe name, so it has to be started first
+  Output := RunCaptureOutput(Executable + ' info "' + Instance + '"', LocalDbInfoTimeout, ExitCode);
+  State := LocalDbStatValue(Output, 'State');
+  if not SameText(State, 'Running') then begin
+    Connection.Log(lcInfo, f_('Starting LocalDB instance "%s" ...', [Instance]));
+    Output := RunCaptureOutput(Executable + ' start "' + Instance + '"', LocalDbStartTimeout, ExitCode);
+    if ExitCode <> 0 then
+      raise EDbError.Create(f_('Could not start LocalDB instance "%s".', [Instance]), 0, Output);
+    Output := RunCaptureOutput(Executable + ' info "' + Instance + '"', LocalDbInfoTimeout, ExitCode);
+  end;
+
+  PipeName := LocalDbStatValue(Output, 'Instance pipe name');
+  // The pipe name appears a moment after the instance has started, so retry briefly
+  for i := 1 to 10 do begin
+    if not PipeName.IsEmpty then
+      Break;
+    Sleep(200);
+    Output := RunCaptureOutput(Executable + ' info "' + Instance + '"', LocalDbInfoTimeout, ExitCode);
+    PipeName := LocalDbStatValue(Output, 'Instance pipe name');
+  end;
+  if PipeName.StartsWith('np:', True) then
+    Delete(PipeName, 1, Length('np:'));
+  if PipeName.IsEmpty then
+    raise EDbError.Create(
+      f_('Could not determine the named pipe of LocalDB instance "%s".', [Instance]),
+      0, Output
+    );
+  Connection.Log(lcInfo, f_('LocalDB instance "%s" listens on pipe %s', [Instance, PipeName]));
+end;
 
 
 
@@ -2826,7 +3121,8 @@ end;
 procedure TAdoDBConnection.SetActive(Value: Boolean);
 var
   Error, NetLib, DataSource, QuotedPassword, ServerVersion, ErrorHint: String;
-  FinalHost, AdditionalParams: String;
+  FinalHost, AdditionalParams, LocalDbPipe: String;
+  LocalDb: Boolean;
   rx: TRegExpr;
   FinalPort, i: Integer;
   IsOldProvider, IsEncryptionRequested: Boolean;
@@ -2835,7 +3131,11 @@ begin
     DoBeforeConnect;
     FinalHost := Parameters.Hostname;
     FinalPort := Parameters.Port;
-    StartSSHTunnel(FinalHost, FinalPort);
+    // Resolve a LocalDB host name before the SSH tunnel rewrites the host name.
+    // An SSH tunnel to a local LocalDB instance is pointless anyway.
+    LocalDb := ResolveLocalDbPipe(Self, FinalHost, LocalDbPipe);
+    if not LocalDb then
+      StartSSHTunnel(FinalHost, FinalPort);
 
     try
       // Creating the ADO object throws exceptions if MDAC is missing, especially on Wine
@@ -2873,6 +3173,13 @@ begin
     DataSource := FinalHost;
     if (Parameters.NetType = ntMSSQL_TCPIP) and (FinalPort <> 0) then
       DataSource := DataSource + ','+IntToStr(FinalPort);
+
+    if LocalDb then begin
+      // A LocalDB instance is only reachable via its named pipe, so the network
+      // library and the data source from the session settings are overridden.
+      NetLib := 'DBNMPNTW';
+      DataSource := LocalDbPipe;
+    end;
 
     // Quote password, just in case there is a semicolon or a double quote in it.
     // See http://forums.asp.net/t/1957484.aspx?Passwords+ending+with+semi+colon+as+the+terminal+element+in+connection+strings+
